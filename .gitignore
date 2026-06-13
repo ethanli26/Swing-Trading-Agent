@@ -22,7 +22,8 @@ env/
 data/cache/
 
 # Logs
-logs/
+logs/*
+!logs/.gitkeep
 *.log
 
 # Testing and coverage
