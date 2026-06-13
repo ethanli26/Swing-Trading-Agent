@@ -1,0 +1,19 @@
+# Core dependencies for the swing trading agent.
+# After your first install, you can pin exact versions with: pip freeze > requirements.txt
+
+# Broker / execution
+ib_async
+
+# Data and news
+yfinance
+finnhub-python
+
+# Analysis
+pandas
+numpy
+
+# Backtesting
+vectorbt
+
+# Config
+python-dotenv
