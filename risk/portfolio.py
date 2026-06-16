@@ -49,6 +49,22 @@ def _portfolio_skip(symbol: str) -> dict:
     return {"status": "skip", "symbol": symbol, "reason": "portfolio limit: no room"}
 
 
+def _min_size_skip(symbol: str) -> dict:
+    """Build a minimum-size skip dict."""
+    return {"status": "skip", "symbol": symbol, "reason": "below minimum size"}
+
+
+def meets_min_size(shares: int, entry_price: float, equity: float) -> bool:
+    """True unless a position is below BOTH the share and value floors.
+
+    A position is kept if it clears either floor: at least
+    ``MIN_POSITION_SHARES`` shares, OR a value of at least
+    ``MIN_POSITION_VALUE_PCT`` of equity. Only positions below both are dropped.
+    """
+    value = shares * entry_price
+    return shares >= config.MIN_POSITION_SHARES or value >= equity * config.MIN_POSITION_VALUE_PCT
+
+
 def _resize_proposal(proposal: dict, shares: int, est_value: float) -> dict:
     """Copy a proposal with updated shares, est_value, and recomputed risk.
 
@@ -62,22 +78,37 @@ def _resize_proposal(proposal: dict, shares: int, est_value: float) -> dict:
     return adjusted
 
 
-def apply_portfolio_limits(proposals, equity, current_positions, sector_of):
+def apply_portfolio_limits(
+    proposals,
+    equity,
+    current_positions,
+    sector_of,
+    *,
+    max_total_pct: float | None = None,
+    max_sector_pct: float | None = None,
+    enforce_min_size: bool = True,
+):
     """Trim a ranked list of proposals to satisfy sector and total exposure caps.
 
     Args:
         proposals: propose dicts (from compute_decision) in watchlist rank order.
         equity: account equity used to size the caps.
-        current_positions: open positions as ``[{symbol, shares, market_value}]``.
+        current_positions: open positions as ``[{symbol, market_value}]``.
         sector_of: dict or callable mapping symbol -> sector.
+        max_total_pct: override for the total-exposure cap (default config value).
+        max_sector_pct: override for the per-sector cap (default config value).
+        enforce_min_size: when True, drop positions below the minimum size floor
+            (reason ``"below minimum size"``) after all trimming.
 
     Returns:
         ``(adjusted_proposals, portfolio_skips)``. Adjusted proposals keep the same
         dict shape with updated shares, est_value, and recomputed risk_dollars.
         Skips are ``{status, symbol, reason}`` dicts.
     """
-    max_sector_value = equity * config.MAX_SECTOR_PCT
-    max_total_value = equity * config.MAX_TOTAL_EXPOSURE
+    sector_pct = config.MAX_SECTOR_PCT if max_sector_pct is None else max_sector_pct
+    total_pct = config.MAX_TOTAL_EXPOSURE if max_total_pct is None else max_total_pct
+    max_sector_value = equity * sector_pct
+    max_total_value = equity * total_pct
 
     total_exposure, sector_exposure = seed_exposure(current_positions, sector_of)
 
@@ -112,6 +143,12 @@ def apply_portfolio_limits(proposals, equity, current_positions, sector_of):
         if shares < 1:
             skips.append(_portfolio_skip(symbol))
             log.info("PORTFOLIO skip %s: no room (sector=%s).", symbol, sector)
+            continue
+
+        # Minimum position size floor: drop negligible positions after all trimming.
+        if enforce_min_size and not meets_min_size(shares, entry_ref, equity):
+            skips.append(_min_size_skip(symbol))
+            log.info("PORTFOLIO skip %s: below minimum size (%d sh).", symbol, shares)
             continue
 
         est_value = shares * entry_ref

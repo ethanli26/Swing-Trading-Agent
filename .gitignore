@@ -20,6 +20,8 @@ env/
 *.sqlite
 *.sqlite3
 data/cache/
+backtest/cache/
+backtest/output/
 
 # Logs
 logs/*

@@ -1,0 +1,413 @@
+"""Walk-forward backtest engine for the breakout + ATR-stop strategy.
+
+The whole point of this module is an HONEST simulation with NO LOOK-AHEAD BIAS.
+The guarantees, and where they are enforced, are:
+
+  * Decisions on day ``i`` read indicators only at ``p = i - 1`` (the prior
+    completed bar). Search for "LOOK-AHEAD GUARD" comments below.
+  * Entries fill at day ``i``'s OPEN, never the signal day's close.
+  * Sizing equity and portfolio caps are valued at the prior close.
+  * The trailing stop active during day ``i`` uses closes only through ``p``.
+  * Regime at entry is read at ``p``.
+
+Strategies are pluggable (signals/base.Strategy): each provides a vectorized
+signal_series that reproduces its canonical generate_signal bar by bar (verified by
+tests). ATR, sizing, stops, portfolio caps, and the regime filter all apply the same
+way regardless of which strategy fired. Read-only: no IBKR, no orders.
+"""
+
+import logging
+import math
+
+import numpy as np
+import pandas as pd
+
+from config import (
+    ATR_MULTIPLE,
+    ATR_PERIOD,
+    BEAR_MAX_TOTAL_EXPOSURE,
+    BEAR_SIZE_MULT,
+    CHANDELIER_ATR_MULT,
+    CONVICTION_SIZING_ENABLED,
+    CRASH_BLOCK_NEW_ENTRIES,
+    REGIME_FILTER_ENABLED,
+    TREND_EXIT_ENABLED,
+    TREND_EXIT_MA,
+)
+from risk.conviction import conviction_multiplier, score_from_factors
+from risk.portfolio import apply_portfolio_limits, meets_min_size
+from risk.position import compute_stop, size_position
+from screener.momentum import LOOKBACK_3M, LOOKBACK_6M
+from signals.base import Strategy
+from signals.breakout import BreakoutStrategy
+
+log = logging.getLogger(__name__)
+
+# Simulated account and cost assumptions (all configurable via run_engine).
+STARTING_EQUITY = 1_000_000.0
+COMMISSION_PER_SHARE = 0.005   # $/share, IBKR-tiered-like
+SLIPPAGE_PCT = 0.0005          # 5 bps, applied against us on entry and exit
+WARMUP_BARS = 200              # need 200 bars for the regime's 200-day average
+
+TRADE_COLUMNS = [
+    "symbol", "strategy", "sector", "entry_date", "entry_price", "exit_date", "exit_price",
+    "shares", "pnl", "pnl_pct", "regime_at_entry", "bars_held", "exit_reason",
+]
+
+
+# --- Vectorized indicators (reproduce the live per-bar functions) -------------
+
+def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """Per-bar Wilder ATR, reproducing risk/position.compute_atr at every bar.
+
+    Drops the first true-range value (no prior close) and applies Wilder smoothing
+    (EWM with alpha = 1/period, adjust=False), which is causal — value at ``t``
+    depends only on bars up to ``t``.
+    """
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    true_range = true_range.iloc[1:]  # drop first row (no previous close)
+    return true_range.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def momentum_series(close: pd.Series) -> pd.Series:
+    """Per-bar momentum score: average of the 3- and 6-month total returns.
+
+    Mirrors screener.momentum.compute_momentum, the same measure used live.
+    """
+    return_3m = close / close.shift(LOOKBACK_3M) - 1.0
+    return_6m = close / close.shift(LOOKBACK_6M) - 1.0
+    return 0.5 * return_3m + 0.5 * return_6m
+
+
+# --- Engine internals ---------------------------------------------------------
+
+def _build_panels(
+    bars: dict[str, pd.DataFrame],
+    master: pd.DatetimeIndex,
+    strategies: list[Strategy],
+) -> dict[str, dict]:
+    """Precompute indicators and per-strategy signals per symbol, aligned to master.
+
+    Computing on each symbol's continuous history first guarantees the indicators
+    and signals equal the live per-bar functions; reindexing afterward leaves NaN on
+    dates a symbol had no data (so it is simply untradeable then).
+    """
+    panels: dict[str, dict] = {}
+    for symbol, frame in bars.items():
+        close, high, low, open_ = frame["Close"], frame["High"], frame["Low"], frame["Open"]
+        atr = atr_series(high, low, close, ATR_PERIOD)
+        mom = momentum_series(close)
+        trend_ma = close.rolling(TREND_EXIT_MA).mean()  # MA for the trend-riding exit
+        signals = {
+            strat.name: strat.signal_series(frame).reindex(master, fill_value=False).to_numpy(dtype=bool)
+            for strat in strategies
+        }
+        # Per-strategy trigger strength (0..1) for conviction sizing.
+        strength = {
+            strat.name: strat.strength_series(frame).reindex(master).to_numpy(dtype=float)
+            for strat in strategies
+        }
+        panels[symbol] = {
+            "open": open_.reindex(master).to_numpy(dtype=float),
+            "high": high.reindex(master).to_numpy(dtype=float),
+            "low": low.reindex(master).to_numpy(dtype=float),
+            "close": close.reindex(master).to_numpy(dtype=float),
+            "atr": atr.reindex(master).to_numpy(dtype=float),
+            "mom": mom.reindex(master).to_numpy(dtype=float),
+            "trend_ma": trend_ma.reindex(master).to_numpy(dtype=float),
+            "signals": signals,
+            "strength": strength,
+        }
+    return panels
+
+
+def _top_sectors_by_day(panels: dict[str, dict], etf_symbols: list[str], n_days: int) -> list[dict]:
+    """Precompute, per day, the top-3 sector ETFs by momentum as ``{etf: rank}``.
+
+    Rank is 1-based (1 = strongest). Membership in the dict is the sector gate; the
+    rank feeds conviction sizing.
+    """
+    top_ranks = []
+    for t in range(n_days):
+        scored = [(etf, panels[etf]["mom"][t]) for etf in etf_symbols
+                  if not np.isnan(panels[etf]["mom"][t])]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        top_ranks.append({etf: rank for rank, (etf, _) in enumerate(scored[:3], start=1)})
+    return top_ranks
+
+
+def _record_trade(position: dict, exit_i: int, exit_price: float, reason: str,
+                  master: pd.DatetimeIndex) -> dict:
+    """Build a closed-trade record from a position and its exit."""
+    proceeds = position["shares"] * exit_price - position["shares"] * position["commission_ps"]
+    pnl = proceeds - position["entry_cost"]
+    return {
+        "symbol": position["symbol"],
+        "strategy": position["strategy"],
+        "sector": position["sector"],
+        "entry_date": position["entry_date"],
+        "entry_price": round(position["entry_price"], 4),
+        "exit_date": master[exit_i],
+        "exit_price": round(exit_price, 4),
+        "shares": position["shares"],
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl / position["entry_cost"], 4) if position["entry_cost"] else 0.0,
+        "regime_at_entry": position["regime_at_entry"],
+        "bars_held": exit_i - position["entry_i"],
+        "exit_reason": reason,
+    }
+
+
+def run_engine(
+    bars: dict[str, pd.DataFrame],
+    regime: pd.Series,
+    sector_map: dict[str, str],
+    etf_symbols: list[str],
+    *,
+    strategies: list[Strategy] | None = None,
+    starting_equity: float = STARTING_EQUITY,
+    commission_per_share: float = COMMISSION_PER_SHARE,
+    slippage_pct: float = SLIPPAGE_PCT,
+    warmup_bars: int = WARMUP_BARS,
+    regime_filter: bool = REGIME_FILTER_ENABLED,
+    enforce_min_size: bool = True,
+    trend_exit: bool = TREND_EXIT_ENABLED,
+    conviction_sizing: bool = CONVICTION_SIZING_ENABLED,
+) -> tuple[pd.Series, pd.DataFrame]:
+    """Run the walk-forward backtest.
+
+    Args:
+        bars: symbol -> adjusted OHLC DataFrame.
+        regime: daily regime labels; its index defines the trading calendar.
+        sector_map: symbol -> sector ETF (only these symbols are tradable).
+        etf_symbols: the sector ETFs available for the momentum gate.
+        strategies: active strategies in PRIORITY order; the first to fire on a name
+            tags the entry. Defaults to breakout-only.
+        regime_filter: when True, the prior day's regime scales new entries
+            (half-size + tighter total cap in bear, no new entries in crash). When
+            False, behavior matches the unfiltered baseline exactly.
+        enforce_min_size: when True, drop positions below the minimum size floor.
+        trend_exit: when True, winners (up >= 1 ATR) switch to a wide chandelier
+            trail plus a trend-MA-break exit. When False, the standard trail is used.
+        conviction_sizing: when True, scale per-trade risk by a conviction multiplier
+            (before caps). When False, sizing is unchanged.
+
+    Returns:
+        ``(equity_curve, trades)`` — a daily equity Series and a trade-log DataFrame.
+    """
+    if strategies is None:
+        strategies = [BreakoutStrategy()]  # default: breakout-only (prior behavior)
+    master = regime.index
+    n_days = len(master)
+    panels = _build_panels(bars, master, strategies)
+    regime_arr = regime.to_numpy()
+    top_ranks = _top_sectors_by_day(panels, [e for e in etf_symbols if e in panels], n_days)
+
+    # Only screener constituents we actually loaded are tradable candidates.
+    tradable = [s for s in sector_map if s in panels]
+
+    cash = starting_equity
+    book: dict[str, dict] = {}
+    trades: list[dict] = []
+    equity_dates: list = []
+    equity_values: list[float] = []
+
+    start_index = max(warmup_bars, 1)
+    for i in range(start_index, n_days):
+        p = i - 1
+
+        # --- Equity & open book valued at the PRIOR close ------------------------
+        # LOOK-AHEAD GUARD: size and cap against close[p] (known at today's open),
+        # never close[i]. last_close was set to close[p] at the end of day p.
+        book_positions = [
+            {"symbol": s, "shares": pos["shares"], "market_value": pos["shares"] * pos["last_close"]}
+            for s, pos in book.items()
+        ]
+        equity_prev = cash + sum(bp["market_value"] for bp in book_positions)
+
+        # --- Entries at TODAY's OPEN --------------------------------------------
+        # LOOK-AHEAD GUARD: every signal input — including the regime — is read at p
+        # (the prior completed bar). We never look at day i's regime or prices here.
+        prior_regime = regime_arr[p]
+
+        # Regime gate. Only active when the filter is on; otherwise these are no-ops
+        # (size_mult=1.0, default total cap, entries not blocked) so the run matches
+        # the unfiltered baseline exactly.
+        block_entries = regime_filter and CRASH_BLOCK_NEW_ENTRIES and prior_regime == "crash"
+        if regime_filter and prior_regime == "bear":
+            size_mult = BEAR_SIZE_MULT          # bear: half-size each new position
+            day_total_cap = BEAR_MAX_TOTAL_EXPOSURE  # bear: tighter total cap today
+        else:
+            size_mult = 1.0
+            day_total_cap = None                # None -> normal MAX_TOTAL_EXPOSURE
+
+        candidates = []
+        if not block_entries:  # crash: take no new entries today (exits still run)
+            sector_ranks = top_ranks[p]
+            for symbol in tradable:
+                if symbol in book:  # at most one open position per name
+                    continue
+                panel = panels[symbol]
+                # Check strategies in priority order; the first to fire as of the
+                # prior bar p tags the entry. LOOK-AHEAD GUARD: signals read at p.
+                triggered = None
+                for strat in strategies:
+                    if panel["signals"][strat.name][p]:
+                        triggered = strat.name
+                        break
+                if triggered is None:
+                    continue
+                atr_p, mom_p, open_i = panel["atr"][p], panel["mom"][p], panel["open"][i]
+                if np.isnan(atr_p) or atr_p <= 0 or np.isnan(mom_p) or np.isnan(open_i):
+                    continue
+                sector_rank = sector_ranks.get(sector_map.get(symbol))  # sector gate as of p
+                if sector_rank is None:
+                    continue
+
+                # Conviction sizing: scale per-trade risk by the setup's strength.
+                # LOOK-AHEAD GUARD: rank, momentum, and signal strength all read at p.
+                if conviction_sizing:
+                    strength_p = panel["strength"][triggered][p]
+                    strength_p = 0.0 if np.isnan(strength_p) else strength_p
+                    score = score_from_factors(sector_rank, mom_p, strength_p)
+                    risk_mult = conviction_multiplier(score)
+                else:
+                    risk_mult = 1.0
+
+                # Entry fills at today's open plus slippage (never the signal close).
+                entry_fill = open_i * (1.0 + slippage_pct)
+                stop = compute_stop(entry_fill, atr_p)                          # reuse risk/position
+                shares, _ = size_position(equity_prev, entry_fill, stop, risk_mult)  # 1% risk x conviction, 10% cap
+                if size_mult != 1.0:  # bear: scale the share size down
+                    shares = int(math.floor(shares * size_mult))
+                if shares <= 0:
+                    continue
+                candidates.append({
+                    "symbol": symbol, "strategy": triggered,
+                    "entry_ref": entry_fill, "stop": stop,
+                    "shares": shares, "est_value": shares * entry_fill,
+                    "atr": atr_p, "momentum": mom_p,
+                })
+
+        # Strongest-first, then portfolio caps (30% sector, total cap by regime) vs book.
+        candidates.sort(key=lambda c: c["momentum"], reverse=True)
+        accepted, _ = apply_portfolio_limits(
+            candidates, equity_prev, book_positions, sector_map,
+            max_total_pct=day_total_cap, enforce_min_size=enforce_min_size,
+        )
+
+        for proposal in accepted:
+            symbol, entry_fill = proposal["symbol"], proposal["entry_ref"]
+            # Cash constraint: never spend cash we do not have.
+            unit_cost = entry_fill + commission_per_share
+            shares = min(proposal["shares"], int(cash // unit_cost)) if unit_cost > 0 else 0
+            if shares < 1:
+                continue
+            # Re-apply the min-size floor after the cash trim (also a sizing finalize).
+            if enforce_min_size and not meets_min_size(shares, entry_fill, equity_prev):
+                continue
+            cost = shares * entry_fill + shares * commission_per_share
+            cash -= cost
+            initial_stop = compute_stop(entry_fill, proposal["atr"])
+            book[symbol] = {
+                "symbol": symbol, "strategy": proposal["strategy"], "sector": sector_map.get(symbol),
+                "shares": shares, "entry_price": entry_fill, "entry_cost": cost,
+                "commission_ps": commission_per_share, "atr_entry": proposal["atr"],
+                "initial_stop": initial_stop, "current_stop": initial_stop,
+                "highest_close": -np.inf, "highest_high": -np.inf, "trend_mode": False,
+                "entry_i": i, "entry_date": master[i],
+                "regime_at_entry": regime_arr[p], "last_close": entry_fill,
+            }
+
+        # --- Exits during today (positions opened on a PRIOR day) ----------------
+        # LOOK-AHEAD GUARD: highs/closes/MA are updated only through p, so every stop
+        # level (and the MA-break signal) checked against today's bar was knowable
+        # before today. When trend_exit is False this reduces to the standard trail.
+        for symbol in list(book.keys()):
+            position = book[symbol]
+            if position["entry_i"] == i:  # entered today; not eligible to exit yet
+                continue
+            panel = panels[symbol]
+            close_p, high_p = panel["close"][p], panel["high"][p]
+            if not np.isnan(close_p):
+                position["highest_close"] = max(position["highest_close"], close_p)
+            if not np.isnan(high_p):
+                position["highest_high"] = max(position["highest_high"], high_p)
+
+            # Latch trend-riding mode once the position is up >= 1 ATR (on close).
+            if trend_exit and not position["trend_mode"] and not np.isnan(close_p):
+                if close_p - position["entry_price"] >= position["atr_entry"]:
+                    position["trend_mode"] = True
+
+            # Update the active trailing stop (ratchets up only).
+            if trend_exit and position["trend_mode"]:
+                # Winner: wide chandelier trail = highest high since entry - mult*ATR.
+                chandelier = position["highest_high"] - CHANDELIER_ATR_MULT * position["atr_entry"]
+                position["current_stop"] = max(position["current_stop"], chandelier)
+            elif not np.isnan(close_p):
+                # Pre-profit / feature off: standard 2*ATR trail on the highest close.
+                trail = position["highest_close"] - ATR_MULTIPLE * position["atr_entry"]
+                position["current_stop"] = max(position["current_stop"], trail)
+
+            open_i, low_i = panel["open"][i], panel["low"][i]
+
+            # Trend-MA-break exit (winners only): a completed close below the trend MA
+            # exits at today's OPEN (the next bar after the signal) — no look-ahead.
+            if trend_exit and position["trend_mode"]:
+                ma_p = panel["trend_ma"][p]
+                if (not np.isnan(ma_p) and not np.isnan(close_p)
+                        and close_p < ma_p and not np.isnan(open_i)):
+                    exit_fill = open_i * (1.0 - slippage_pct)
+                    cash += position["shares"] * exit_fill - position["shares"] * commission_per_share
+                    trades.append(_record_trade(position, i, exit_fill, "ma_break", master))
+                    del book[symbol]
+                    continue
+
+            # Price-stop exit: today's low touches the trailing/initial stop.
+            if np.isnan(low_i):
+                continue
+            if low_i <= position["current_stop"]:
+                # Fill at the stop, or at the open if the day gapped through it.
+                if not np.isnan(open_i) and open_i < position["current_stop"]:
+                    raw = open_i
+                else:
+                    raw = position["current_stop"]
+                exit_fill = raw * (1.0 - slippage_pct)
+                cash += position["shares"] * exit_fill - position["shares"] * commission_per_share
+                if position["trend_mode"]:
+                    reason = "chandelier_stop"
+                else:
+                    reason = "trailing_stop" if position["current_stop"] > position["initial_stop"] + 1e-9 else "stop"
+                trades.append(_record_trade(position, i, exit_fill, reason, master))
+                del book[symbol]
+
+        # --- End-of-day mark-to-market (reporting only) --------------------------
+        # Marking the equity curve to close[i] is fine: it feeds reports, never a
+        # decision. Sizing/caps above already used close[p].
+        for symbol, position in book.items():
+            close_i = panels[symbol]["close"][i]
+            if not np.isnan(close_i):
+                position["last_close"] = close_i
+        equity_values.append(cash + sum(pos["shares"] * pos["last_close"] for pos in book.values()))
+        equity_dates.append(master[i])
+
+    # --- Liquidate any open positions at the final close ------------------------
+    final_i = n_days - 1
+    for symbol in list(book.keys()):
+        position = book[symbol]
+        close_f = panels[symbol]["close"][final_i]
+        price = position["last_close"] if np.isnan(close_f) else close_f
+        exit_fill = price * (1.0 - slippage_pct)
+        cash += position["shares"] * exit_fill - position["shares"] * commission_per_share
+        trades.append(_record_trade(position, final_i, exit_fill, "end_of_backtest", master))
+        del book[symbol]
+
+    equity_curve = pd.Series(equity_values, index=pd.DatetimeIndex(equity_dates), name="equity")
+    trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
+    log.info("Backtest complete: %d trades, final equity $%s.",
+             len(trades_df), f"{equity_curve.iloc[-1]:,.0f}" if not equity_curve.empty else "n/a")
+    return equity_curve, trades_df

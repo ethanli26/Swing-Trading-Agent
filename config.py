@@ -40,6 +40,12 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 # Breakout entry: latest close must exceed the high of the prior N sessions.
 BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "20"))
 
+# Pullback entry: uptrend (close above MA), a recent dip to within TOUCH_PCT of the
+# MA, then a confirmed bounce over the last BOUNCE_LOOKBACK sessions.
+PULLBACK_MA = int(os.getenv("PULLBACK_MA", "50"))
+PULLBACK_TOUCH_PCT = float(os.getenv("PULLBACK_TOUCH_PCT", "0.02"))
+PULLBACK_BOUNCE_LOOKBACK = int(os.getenv("PULLBACK_BOUNCE_LOOKBACK", "3"))
+
 # --- Risk and position sizing ---
 # ATR (Average True Range) settings for volatility-based stops.
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
@@ -53,6 +59,34 @@ MAX_SECTOR_PCT = float(os.getenv("MAX_SECTOR_PCT", "0.30"))
 # Cap total deployed capital at this fraction of equity.
 MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "0.60"))
 
+# Minimum position size floor. A position is dropped only if it is below BOTH the
+# share floor AND the value floor (a fraction of equity), which removes negligible
+# 1-share "stub" positions left behind by portfolio trimming.
+MIN_POSITION_SHARES = int(os.getenv("MIN_POSITION_SHARES", "10"))
+MIN_POSITION_VALUE_PCT = float(os.getenv("MIN_POSITION_VALUE_PCT", "0.01"))
+
+# --- Regime-based scaling (backtest entry/sizing filter) ---
+# When enabled, the PRIOR day's market regime scales new entries (see
+# backtest/engine.py). When disabled, the engine matches the unfiltered baseline.
+REGIME_FILTER_ENABLED = _env_bool("REGIME_FILTER_ENABLED", True)
+BEAR_SIZE_MULT = float(os.getenv("BEAR_SIZE_MULT", "0.5"))                    # half-size in bear
+BEAR_MAX_TOTAL_EXPOSURE = float(os.getenv("BEAR_MAX_TOTAL_EXPOSURE", "0.30"))  # tighter total cap in bear
+CRASH_BLOCK_NEW_ENTRIES = _env_bool("CRASH_BLOCK_NEW_ENTRIES", True)          # no new entries in crash
+
+# --- Trend-riding exit (let winners run; backtest exit filter) ---
+# Once a position is up >= 1 ATR, switch to a wider chandelier trail and also exit
+# when the close breaks below the trend MA. When disabled, the standard trail is used.
+TREND_EXIT_ENABLED = _env_bool("TREND_EXIT_ENABLED", True)
+TREND_EXIT_MA = int(os.getenv("TREND_EXIT_MA", "50"))                  # exit when close breaks below this MA
+CHANDELIER_ATR_MULT = float(os.getenv("CHANDELIER_ATR_MULT", "3.0"))   # trail = highest high since entry - mult*ATR
+
+# --- Conviction sizing (bet bigger on the best setups) ---
+# Scales RISK_PER_TRADE by a per-trade multiplier in [MIN, MAX] before the caps,
+# so the strongest setups risk more (but the per-name and portfolio caps still bind).
+CONVICTION_SIZING_ENABLED = _env_bool("CONVICTION_SIZING_ENABLED", True)
+CONVICTION_MAX_MULT = float(os.getenv("CONVICTION_MAX_MULT", "2.0"))   # strongest setups up to 2x base risk
+CONVICTION_MIN_MULT = float(os.getenv("CONVICTION_MIN_MULT", "0.5"))   # weakest qualifying setups down to 0.5x
+
 # --- Execution safety ---
 # When True, the decision runner prints proposals but places no orders.
-DRY_RUN = _env_bool("DRY_RUN", False)
+DRY_RUN = _env_bool("DRY_RUN", True)

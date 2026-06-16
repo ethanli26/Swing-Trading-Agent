@@ -53,14 +53,21 @@ def compute_stop(entry_price: float, atr: float) -> float:
     return entry_price - config.ATR_MULTIPLE * atr
 
 
-def size_position(equity: float, entry_price: float, stop_price: float) -> tuple[int, float]:
+def size_position(
+    equity: float,
+    entry_price: float,
+    stop_price: float,
+    risk_mult: float = 1.0,
+) -> tuple[int, float]:
     """Size a position from the per-trade risk budget and the max-position cap.
 
-    Returns ``(shares, risk_dollars)``. Shares is the smaller of the
-    risk-budget size and the max-position cap. If the per-share risk is
-    non-positive or the result rounds to zero shares, returns ``(0, 0.0)``.
+    ``risk_mult`` scales the per-trade risk budget (e.g. conviction sizing) BEFORE
+    the per-name cap, so a larger bet still cannot exceed the max-position cap.
+    Returns ``(shares, risk_dollars)``. Shares is the smaller of the risk-budget
+    size and the max-position cap. If the per-share risk is non-positive or the
+    result rounds to zero shares, returns ``(0, 0.0)``.
     """
-    risk_dollars = equity * config.RISK_PER_TRADE
+    risk_dollars = equity * config.RISK_PER_TRADE * risk_mult
     per_share_risk = entry_price - stop_price
 
     if per_share_risk <= 0 or entry_price <= 0:
