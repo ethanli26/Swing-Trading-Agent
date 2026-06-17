@@ -25,9 +25,9 @@ def _env_bool(name: str, default: bool) -> bool:
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
 # --- Interactive Brokers (paper) ---
-IB_HOST = os.getenv("IB_HOST", "127.0.0.1")
-IB_PORT = int(os.getenv("IB_PORT", "7497"))
-IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))
+IB_HOST = os.getenv("IB_HOST", "127.0.0.1")          # TWS/Gateway host
+IB_PORT = int(os.getenv("IB_PORT", "7497"))          # 7497 = paper port (keep on paper)
+IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))   # API client id
 
 # --- Agent behavior ---
 # Autonomy gate mode: signal_only | approve | semi_auto | full_auto. Start safe.
@@ -118,3 +118,12 @@ OVERLAY_INSTRUMENT = os.getenv("OVERLAY_INSTRUMENT", "SPY")
 # --- Execution safety ---
 # When True, the decision runner prints proposals but places no orders.
 DRY_RUN = _env_bool("DRY_RUN", True)
+
+# --- Capstone research surface (read by main.py) ---
+# Universe for `research` / `backtest`: large | mid | small | broad. Default "large"
+# reproduces the canonical numbers; the lists live in backtest/universe.py.
+RESEARCH_UNIVERSE = os.getenv("RESEARCH_UNIVERSE", "large")
+# Strategies active in the canonical backtest, by registered name (see strategies/).
+ACTIVE_STRATEGIES = tuple(s.strip() for s in os.getenv("ACTIVE_STRATEGIES", "breakout,pullback").split(",") if s.strip())
+# Research/backtest window: price backtests use the full cached history (~15y, set by
+# backtest/data.HISTORY_YEARS); factor & earnings tests use EARNINGS_BACKTEST_YEARS above.

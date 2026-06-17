@@ -23,6 +23,7 @@ data/cache/
 backtest/cache/
 backtest/output/
 ml/output/
+output/
 
 # Logs
 logs/*

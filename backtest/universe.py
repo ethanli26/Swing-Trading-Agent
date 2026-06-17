@@ -67,7 +67,55 @@ SMALL: dict[str, list[str]] = {
     "XLC": ["SALM", "CCO"],
 }
 
-UNIVERSES: dict[str, dict[str, list[str]]] = {"large": LARGE, "mid": MID, "small": SMALL}
+# Additional liquid, long-listed US names (mega/large/mid) to broaden the sample
+# across the cap spectrum and all sectors. Still TODAY'S survivors.
+BROAD_EXTRA: dict[str, list[str]] = {
+    "XLK": ["INTC", "CSCO", "QCOM", "TXN", "IBM", "INTU", "AMAT", "MU", "ADI", "KLAC",
+            "GLW", "HPQ", "WDC", "SWKS", "MCHP", "NTAP", "AKAM", "JNPR"],
+    "XLF": ["AXP", "USB", "PNC", "TFC", "COF", "SCHW", "CME", "ICE", "MMC", "MET",
+            "PRU", "AIG", "TRV", "ALL", "AFL", "BK", "STT", "FITB", "HBAN", "RF"],
+    "XLV": ["AMGN", "GILD", "BMY", "CVS", "CI", "MCK", "ZTS", "BDX", "SYK", "BSX",
+            "MDT", "EW", "ISRG", "IDXX", "BIIB", "VRTX", "REGN", "A", "DGX", "LH"],
+    "XLY": ["TGT", "GM", "F", "EBAY", "MAR", "YUM", "CMG", "ORLY", "AZO", "ROST",
+            "TJX", "DG", "GPC", "LVS", "WYNN", "EXPE", "RCL", "CCL", "LEN", "DHI"],
+    "XLP": ["CL", "KMB", "GIS", "K", "HSY", "STZ", "MDLZ", "KR", "SYY", "ADM",
+            "MNST", "CLX", "EL", "TAP", "TSN", "HRL", "MKC", "CAG"],
+    "XLI": ["LMT", "NOC", "GD", "EMR", "ETN", "ITW", "MMM", "FDX", "CSX", "NSC",
+            "WM", "RSG", "PH", "ROK", "CMI", "PCAR", "GWW", "FAST", "DOV", "EFX"],
+    "XLE": ["OXY", "VLO", "WMB", "KMI", "OKE", "HAL", "BKR", "DVN", "HES", "CTRA", "EQT"],
+    "XLB": ["NUE", "STLD", "VMC", "MLM", "PPG", "IFF", "ALB", "CF", "MOS", "FMC",
+            "EMN", "IP", "PKG", "BALL"],
+    "XLU": ["SRE", "PEG", "ED", "EIX", "XEL", "WEC", "ES", "AEE", "DTE", "FE",
+            "ETR", "PPL", "CMS", "CNP", "ATO", "AES", "NI", "PNW"],
+    "XLRE": ["DLR", "SBAC", "WY", "AVB", "EQR", "ARE", "VTR", "MAA", "ESS", "KIM",
+             "REG", "FRT", "BXP", "HST", "UDR"],
+    "XLC": ["T", "CHTR", "EA", "FOXA", "LYV", "MTCH", "PARA", "NWSA"],
+}
+
+
+def _merge_universes(*universes: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Merge sector-keyed universes, deduping each symbol to its first sector seen."""
+    merged: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for universe in universes:
+        for sector, symbols in universe.items():
+            for symbol in symbols:
+                if symbol in seen:
+                    continue
+                merged.setdefault(sector, []).append(symbol)
+                seen.add(symbol)
+    return merged
+
+
+# Broad universe: ~300+ liquid US names spanning the cap spectrum and all sectors.
+# SURVIVORSHIP CAVEAT: still today's survivors — widening the sample reduces large-cap
+# concentration bias but does NOT remove survivorship bias (only point-in-time paid
+# data can). The liquidity filter still excludes untradeable names at evaluation time.
+BROAD: dict[str, list[str]] = _merge_universes(LARGE, MID, SMALL, BROAD_EXTRA)
+
+UNIVERSES: dict[str, dict[str, list[str]]] = {
+    "large": LARGE, "mid": MID, "small": SMALL, "broad": BROAD,
+}
 
 
 def sector_map(name: str) -> dict[str, str]:

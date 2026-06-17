@@ -202,6 +202,7 @@ def run_engine(
     stats: dict | None = None,
     overlay: bool = OVERLAY_ENABLED,
     overlay_returns: np.ndarray | None = None,
+    strategy_active=None,
 ) -> tuple[pd.Series, pd.DataFrame]:
     """Run the walk-forward backtest.
 
@@ -238,6 +239,9 @@ def run_engine(
             its daily return (marked to market at the close) instead of earning 0.
         overlay_returns: the overlay instrument's daily returns aligned to ``master``
             (required when ``overlay`` is True).
+        strategy_active: optional ``f(regime_label) -> set of active strategy names``;
+            evaluated on the prior-day regime so only those strategies may fire that
+            day (a regime-aware selector). None means all strategies are always active.
 
     Returns:
         ``(equity_curve, trades)`` — a daily equity Series and a trade-log DataFrame.
@@ -305,6 +309,9 @@ def run_engine(
         candidates = []
         if not block_entries:  # crash: take no new entries today (exits still run)
             sector_ranks = top_ranks[p]
+            # Regime-aware selector: which strategies may fire today, from the PRIOR
+            # day's regime. LOOK-AHEAD GUARD: regime read at p, never at i.
+            active_names = strategy_active(prior_regime) if strategy_active is not None else None
             for symbol in tradable:
                 if symbol in book:  # at most one open position per name
                     continue
@@ -313,6 +320,8 @@ def run_engine(
                 # prior bar p tags the entry. LOOK-AHEAD GUARD: signals read at p.
                 triggered = None
                 for strat in strategies:
+                    if active_names is not None and strat.name not in active_names:
+                        continue
                     if panel["signals"][strat.name][p]:
                         triggered = strat.name
                         break
